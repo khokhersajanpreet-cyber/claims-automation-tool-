@@ -74,6 +74,10 @@ def clean_message_text(msg, lead_id=""):
             final_lines.append(l.strip())
     return '\n'.join(final_lines).strip()
 
+def clean_time_string(t):
+    # This safely removes the problematic formatting characters without using pyarrow regex
+    return re.sub(r'[\u202f\u200e\u202a\u202c\u202d\u2069]', ' ', str(t))
+
 def analyze_pendency_and_date(row, pendency_col, exp_date_col, work_date_col, remarks_col):
     msg = str(row.get(remarks_col, "")).lower()
     if msg == "agent not shared remarks on whatsapp" or not msg:
@@ -123,88 +127,108 @@ def analyze_pendency_and_date(row, pendency_col, exp_date_col, work_date_col, re
 # --- Step 3: Run Processor ---
 st.subheader("Step 3: Process & Download")
 if st.button("🚀 Process Data", type="primary"):
-    if not chat_file or not pendency_file:
-        st.error("⚠️ Please upload BOTH files.")
+    if not chat_file and not pendency_file:
+        st.error("⚠️ Please upload at least one file to process.")
     else:
         with st.spinner("Analyzing data..."):
             try:
+                df_chat = pd.DataFrame()
+                msg_mapping = {}
+
                 # --- PROCESS CHAT FILE ---
-                if chat_file.name.endswith(".xlsx"):
-                    df_chat = pd.read_excel(chat_file)
-                    if 'Booking/Lead ID' not in df_chat.columns:
-                        df_chat['Booking/Lead ID'] = df_chat.iloc[:, 0].apply(extract_id)
-                else:
-                    # Extract from TXT / ZIP
-                    if chat_file.name.endswith(".zip"):
-                        with zipfile.ZipFile(chat_file) as z:
-                            txt_name = [n for n in z.namelist() if n.endswith('.txt')][0]
-                            with z.open(txt_name) as f:
-                                chat_text = f.read().decode("utf-8", errors="replace")
+                if chat_file is not None:
+                    if chat_file.name.endswith(".xlsx"):
+                        df_chat = pd.read_excel(chat_file)
+                        if 'Booking/Lead ID' not in df_chat.columns:
+                            df_chat['Booking/Lead ID'] = df_chat.iloc[:, 0].apply(extract_id)
                     else:
-                        chat_text = chat_file.read().decode("utf-8", errors="replace")
-                        
-                    parsed_data, cur_date, cur_time, cur_sender, cur_msg = [], "", "", "", []
-                    for line in [re.sub(r'[\u200e\u202a\u202c\u202d\u2069]', '', l).strip() for l in chat_text.split('\n') if l.strip()]:
-                        match = re.match(r'^\[?(\d{2}/\d{2}/\d{2,4}),\s*(.*?)\]?\s*(.*?):\s*(.*)', line)
-                        if not match: match = re.match(r'^(\d{2}/\d{2}/\d{2,4}),\s*(.*?)\s*-\s*(.*?):\s*(.*)', line)
-                        if match:
-                            if cur_sender: parsed_data.append([cur_date, cur_time, cur_sender, '\n'.join(cur_msg)])
-                            cur_date, cur_time, cur_sender, m = match.groups()
-                            cur_sender, cur_msg = cur_sender.strip(), [m.strip()]
+                        # Extract from TXT / ZIP
+                        if chat_file.name.endswith(".zip"):
+                            with zipfile.ZipFile(chat_file) as z:
+                                txt_name = [n for n in z.namelist() if n.endswith('.txt')][0]
+                                with z.open(txt_name) as f:
+                                    chat_text = f.read().decode("utf-8", errors="replace")
                         else:
-                            if cur_sender: cur_msg.append(line)
-                    if cur_sender: parsed_data.append([cur_date, cur_time, cur_sender, '\n'.join(cur_msg)])
+                            chat_text = chat_file.read().decode("utf-8", errors="replace")
+                            
+                        parsed_data, cur_date, cur_time, cur_sender, cur_msg = [], "", "", "", []
+                        for line in [re.sub(r'[\u200e\u202a\u202c\u202d\u2069]', '', l).strip() for l in chat_text.split('\n') if l.strip()]:
+                            match = re.match(r'^\[?(\d{2}/\d{2}/\d{2,4}),\s*(.*?)\]?\s*(.*?):\s*(.*)', line)
+                            if not match: match = re.match(r'^(\d{2}/\d{2}/\d{2,4}),\s*(.*?)\s*-\s*(.*?):\s*(.*)', line)
+                            if match:
+                                if cur_sender: parsed_data.append([cur_date, cur_time, cur_sender, '\n'.join(cur_msg)])
+                                cur_date, cur_time, cur_sender, m = match.groups()
+                                cur_sender, cur_msg = cur_sender.strip(), [m.strip()]
+                            else:
+                                if cur_sender: cur_msg.append(line)
+                        if cur_sender: parsed_data.append([cur_date, cur_time, cur_sender, '\n'.join(cur_msg)])
+                        
+                        df_chat = pd.DataFrame(parsed_data, columns=['Date', 'Time', 'Sender', 'Raw_Message'])
+                        df_chat['Booking/Lead ID'] = df_chat['Raw_Message'].apply(extract_id)
+                        df_chat['Message'] = df_chat.apply(lambda r: clean_message_text(r['Raw_Message'], r['Booking/Lead ID']), axis=1)
+
+                    # Format Datetime safely
+                    df_chat['Clean_Time'] = df_chat['Time'].apply(clean_time_string)
+                    df_chat['Date_Parsed'] = pd.to_datetime(df_chat['Date'], format='mixed', dayfirst=True, errors='coerce')
+                    df_chat['DateTime_str'] = df_chat['Date'].astype(str) + ' ' + df_chat['Clean_Time']
+                    df_chat['DateTime'] = pd.to_datetime(df_chat['DateTime_str'], format='mixed', dayfirst=True, errors='coerce')
                     
-                    df_chat = pd.DataFrame(parsed_data, columns=['Date', 'Time', 'Sender', 'Raw_Message'])
-                    df_chat['Booking/Lead ID'] = df_chat['Raw_Message'].apply(extract_id)
-                    df_chat['Message'] = df_chat.apply(lambda r: clean_message_text(r['Raw_Message'], r['Booking/Lead ID']), axis=1)
+                    # Filter Dates
+                    if enable_date_filter and start_date and end_date:
+                        df_chat = df_chat[(df_chat['Date_Parsed'] >= pd.to_datetime(start_date)) & (df_chat['Date_Parsed'] <= pd.to_datetime(end_date))]
+                    
+                    # Create Output Chat Excel
+                    df_chat_out = df_chat[['Date', 'Time', 'Booking/Lead ID', 'Message']].copy()
+                    chat_buffer = io.BytesIO()
+                    with pd.ExcelWriter(chat_buffer, engine='openpyxl') as writer:
+                        for date in sorted(df_chat_out['Date'].unique()):
+                            sheet_name = str(date).replace('/', '-')
+                            df_date = df_chat_out[df_chat_out['Date'] == date].copy()
+                            df_date.to_excel(writer, index=False, sheet_name=sheet_name[:31]) # Excel sheet name length limit
+                    chat_buffer.seek(0)
+                    st.download_button("📥 Download Cleaned WhatsApp Chat (.xlsx)", data=chat_buffer, file_name="Cleaned_Chat_Log.xlsx")
 
-                # Format Datetime
-                df_chat['Clean_Time'] = df_chat['Time'].astype(str).str.replace(r'[^a-zA-Z0-9: ]', ' ', regex=True)
-                df_chat['Date_Parsed'] = pd.to_datetime(df_chat['Date'], format='mixed', dayfirst=True, errors='coerce')
-                df_chat['DateTime'] = pd.to_datetime(df_chat['Date'].astype(str) + ' ' + df_chat['Clean_Time'], format='mixed', dayfirst=True, errors='coerce')
-                
-                # Filter Dates
-                if enable_date_filter and start_date and end_date:
-                    df_chat = df_chat[(df_chat['Date_Parsed'] >= pd.to_datetime(start_date)) & (df_chat['Date_Parsed'] <= pd.to_datetime(end_date))]
-                
-                # Create Output Chat Excel
-                df_chat_out = df_chat[['Date', 'Time', 'Booking/Lead ID', 'Message']].copy()
-                chat_buffer = io.BytesIO()
-                df_chat_out.to_excel(chat_buffer, index=False, engine='openpyxl')
-                chat_buffer.seek(0)
-                
+                    # Map messages for pendency
+                    df_chat_valid = df_chat.dropna(subset=['Booking/Lead ID']).copy()
+                    df_chat_valid['Clean_ID'] = df_chat_valid['Booking/Lead ID'].apply(clean_id_str)
+                    df_chat_valid = df_chat_valid[df_chat_valid['Clean_ID'] != '']
+                    df_chat_valid = df_chat_valid.sort_values(by='DateTime', ascending=False).drop_duplicates(subset=['Clean_ID'], keep='first')
+                    msg_mapping = dict(zip(df_chat_valid['Clean_ID'], df_chat_valid['Message']))
+
                 # --- PROCESS PENDENCY SHEET ---
-                df_chat_valid = df_chat.dropna(subset=['Booking/Lead ID']).copy()
-                df_chat_valid['Clean_ID'] = df_chat_valid['Booking/Lead ID'].apply(clean_id_str)
-                df_chat_valid = df_chat_valid[df_chat_valid['Clean_ID'] != '']
-                df_chat_valid = df_chat_valid.sort_values(by='DateTime', ascending=False).drop_duplicates(subset=['Clean_ID'], keep='first')
-                msg_mapping = dict(zip(df_chat_valid['Clean_ID'], df_chat_valid['Message']))
-                
-                df_pendency = pd.read_excel(pendency_file)
-                lead_col = [c for c in df_pendency.columns if 'lead' in str(c).lower()][0]
-                remarks_col = [c for c in df_pendency.columns if 'remark' in str(c).lower()][0]
-                pendency_col = [c for c in df_pendency.columns if 'pendency' in str(c).lower()][0]
-                exp_date_col = [c for c in df_pendency.columns if 'expected' in str(c).lower()][0]
-                work_date_col = [c for c in df_pendency.columns if 'work date' in str(c).lower()][0]
-                
-                df_pendency['Clean_LeadId'] = df_pendency[lead_col].apply(clean_id_str)
-                df_pendency[remarks_col] = df_pendency['Clean_LeadId'].apply(lambda cid: msg_mapping.get(cid, "Agent not shared remarks on whatsapp") if cid else "")
-                df_pendency[[pendency_col, exp_date_col]] = df_pendency.apply(lambda r: analyze_pendency_and_date(r, pendency_col, exp_date_col, work_date_col, remarks_col), axis=1, result_type='expand')
-                df_pendency = df_pendency.drop(columns=['Clean_LeadId'])
-                
-                pendency_buffer = io.BytesIO()
-                df_pendency.to_excel(pendency_buffer, index=False, engine='openpyxl')
-                pendency_buffer.seek(0)
+                if pendency_file is not None:
+                    df_pendency = pd.read_excel(pendency_file)
+                    lead_col = [c for c in df_pendency.columns if 'lead' in str(c).lower()][0]
+                    remarks_col = [c for c in df_pendency.columns if 'remark' in str(c).lower()]
+                    remarks_col = remarks_col[0] if remarks_col else 'Remarks'
+                    pendency_col = [c for c in df_pendency.columns if 'pendency' in str(c).lower()]
+                    pendency_col = pendency_col[0] if pendency_col else 'Pendency'
+                    exp_date_col = [c for c in df_pendency.columns if 'expected' in str(c).lower()]
+                    exp_date_col = exp_date_col[0] if exp_date_col else 'Expected appointment'
+                    work_date_col = [c for c in df_pendency.columns if 'work date' in str(c).lower()]
+                    work_date_col = work_date_col[0] if work_date_col else 'Work Date'
+                    
+                    # Ensure columns exist
+                    for col in [remarks_col, pendency_col, exp_date_col]:
+                        if col not in df_pendency.columns: df_pendency[col] = ""
+                    
+                    df_pendency['Clean_LeadId'] = df_pendency[lead_col].apply(clean_id_str)
+                    
+                    if msg_mapping: # Only update remarks if a chat file was provided
+                        df_pendency[remarks_col] = df_pendency['Clean_LeadId'].apply(lambda cid: msg_mapping.get(cid, "Agent not shared remarks on whatsapp") if cid else "")
+                    
+                    df_pendency[[pendency_col, exp_date_col]] = df_pendency.apply(lambda r: analyze_pendency_and_date(r, pendency_col, exp_date_col, work_date_col, remarks_col), axis=1, result_type='expand')
+                    df_pendency = df_pendency.drop(columns=['Clean_LeadId'])
+                    
+                    pendency_buffer = io.BytesIO()
+                    df_pendency.to_excel(pendency_buffer, index=False, engine='openpyxl')
+                    pendency_buffer.seek(0)
 
-                st.success("✅ Both files successfully processed!")
+                    st.download_button("📥 Download Updated Pendency Sheet (.xlsx)", data=pendency_buffer, file_name="Updated_Pendency_List.xlsx")
+                    st.subheader("Preview of Updated Pendency Data")
+                    st.dataframe(df_pendency.head(15))
                 
-                # --- DOWNLOAD BUTTONS ---
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.download_button("📥 1. Download Evaluated WhatsApp Chat (.xlsx)", data=chat_buffer, file_name="Evaluated_Chat_Log.xlsx")
-                with c2:
-                    st.download_button("📥 2. Download Updated Pendency Sheet (.xlsx)", data=pendency_buffer, file_name="Updated_Pendency_List.xlsx")
+                st.success("✅ Processing complete!")
                 
             except Exception as e:
                 st.error(f"Error processing files: {e}")
